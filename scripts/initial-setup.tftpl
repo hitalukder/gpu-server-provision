@@ -1,0 +1,201 @@
+#!/bin/bash
+
+os_name=${os_name}
+
+case $${os_name} in
+
+  red-9-amd64)
+    # Set variables
+    data_disk=vdd # 2nd disk for data volume
+    default_user=vpcuser # default Linux user
+
+    # Install packages
+    dnf install -y acl ansible-core jq lvm2 net-tools nodejs python3-pip sysstat tmux tree unzip
+    ;;
+
+  ubuntu-20-04-amd64|ubuntu-22-04-amd64)
+    # Set variables
+    data_disk=vdd # 2nd disk for data volume
+    default_user=ubuntu # default Linux user
+
+    # Install packages
+    apt-get update
+    apt-get install -y acl ansible-core build-essential jq lvm2 net-tools nodejs python3-pip sysstat tmux tree unzip
+    ;;
+
+  *)
+    echo -n "ERROR: unknown os"
+    exit 1
+    ;;
+esac
+
+# Configure a volume
+pvcreate /dev/$${data_disk}
+vgcreate data /dev/$${data_disk}
+lvcreate -l 100%FREE -n home data
+mkfs.xfs /dev/data/home
+
+# Mount the volume on /home
+(cd /home; tar cfBp /tmp/home.tar .)
+mount /dev/data/home /home
+(cd /home; tar xf /tmp/home.tar)
+echo -e "UUID=$(findmnt /home -o UUID -n)\t/home\txfs\tdefaults\t0 2\n" >> /etc/fstab
+
+# Install Docker CE
+case $${os_name} in
+
+  red-9-amd64)
+
+    # Add yum repository
+    dnf config-manager --add-repo=https://download.docker.com/linux/centos/docker-ce.repo
+
+    # Install Docker CE
+    dnf -y install docker-ce --allowerasing
+    systemctl enable --now docker
+    ;;
+
+  ubuntu-20-04-amd64|ubuntu-22-04-amd64)
+
+    # Add Docker's official GPG key
+    apt-get update
+    apt-get install -y ca-certificates curl
+    install -m 0755 -d /etc/apt/keyrings
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+    chmod a+r /etc/apt/keyrings/docker.asc
+
+    # Add Docker repository to Apt sources
+    echo \
+      "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu \
+      $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+      tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+    # Install Docker CE
+    apt-get update
+    apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin
+    ;;
+
+  *)
+    echo "ERROR: unknown os"
+    exit 1
+    ;;
+esac
+
+# Create a /etc/docker/daemon.json file to relocate the Docker root data directory
+mkdir -p /etc/docker && chmod 0755 /etc/docker
+touch /etc/docker/daemon.json && chmod 0644 /etc/docker/daemon.json
+cat <<EOF > "/etc/docker/daemon.json"
+{
+  "data-root": "/home/docker"
+}
+EOF
+
+# Create a systemd service for Jupyter Lab
+mkdir -p /home/$${default_user}/work && chown $${default_user}:100 /home/$${default_user}/work
+chmod 775 /home/$${default_user}/work && chmod g+s /home/$${default_user}/work
+usermod -aG docker $${default_user}
+mkdir -p /etc/docker/compose/jupyter-lab
+cat <<EOF > "/etc/docker/compose/jupyter-lab/docker-compose.yml"
+version: '3'
+
+services:
+  jupyter-lab:
+    image: ${jupyter_lab_image}
+    container_name: jupyter-lab
+    hostname: jupyter-lab
+    user: root
+    pid: host
+    environment:
+      GRANT_SUDO: "yes"
+      RESTARTABLE: "yes"
+      GEN_CERT: "yes"
+    working_dir: "/home/jovyan/work"
+    ports:
+      - "8888:8888"
+      - "${tcp_port_min}-${tcp_port_max}:${tcp_port_min}-${tcp_port_max}"
+    deploy:
+      resources:
+        reservations:
+          %{ if cpu_reservation != null }cpus: "${cpu_reservation}"%{ endif }
+          %{ if memory_reservation != null }memory: "${memory_reservation}"%{ endif }
+          devices:
+            - driver: nvidia
+              count: "${gpu_count}"
+              capabilities: ["gpu"]
+        limits:
+          %{ if cpu_limit != null }cpus: "${cpu_limit}"%{ endif }
+          %{ if memory_limit != null }memory: "${memory_limit}"%{ endif }
+    volumes:
+      - /home/$${default_user}/work:/home/jovyan/work
+EOF
+
+cat <<EOF > "/etc/systemd/system/docker-compose@.service"
+[Unit]
+Description=%i service with docker compose
+PartOf=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=true
+WorkingDirectory=/etc/docker/compose/%i
+ExecStart=/usr/bin/docker compose up -d --remove-orphans
+ExecStop=/usr/bin/docker compose stop
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# Enable jupyter-lab service
+systemctl enable docker-compose@jupyter-lab
+
+# Install CUDA
+case $${os_name} in
+
+  red-9-amd64)
+
+    # Install EPEL
+    subscription-manager repos --enable=rhel-9-for-$(arch)-appstream-rpms \
+      --enable=rhel-9-for-$(arch)-baseos-rpms \
+      --enable codeready-builder-for-rhel-9-$(arch)-rpms
+    dnf install -y --nogpgcheck https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm
+
+    # Install CUDA
+    dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel9/$(arch)/cuda-rhel9.repo
+    dnf config-manager --add-repo https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-container-toolkit.repo
+    dnf module install -y nvidia-driver:latest-dkms # Other options: nvidia-driver:latest-dkms, nvidia-driver:latest (precompiled), etc.
+    dnf install -y cuda-toolkit
+    dnf install -y nvidia-gds
+    dnf install -y nvidia-container-toolkit
+    ;;
+
+  ubuntu-20-04-amd64|ubuntu-22-04-amd64)
+
+    # # Install kernel headers and development packages for the running kernel
+    # apt-get install linux-headers-$(uname -r)
+
+    # Remove Outdated Signing Key
+    apt-key del 7fa2af80
+
+    # Download and install the new cuda-keyring package
+    distro=$(lsb_release -s -r | tr -dc '[[:digit:]]')
+    arch=$(uname -i)
+    wget -O /tmp/cuda-keying_1.1-1_all.deb \
+      https://developer.download.nvidia.com/compute/cuda/repos/ubuntu$${distro}/$${arch}/cuda-keyring_1.1-1_all.deb
+    apt-get install -y /tmp/cuda-keying_1.1-1_all.deb
+
+    # Install CUDA
+    apt-get update
+    apt-get install -y cuda
+    apt-get install -y nvidia-gds
+    apt-get install -y nvidia-container-toolkit
+    ;;
+
+  *)
+    echo "ERROR: unknown os"
+    exit 1
+    ;;
+esac
+
+# Reboot is required
+touch /var/run/reboot-required
+

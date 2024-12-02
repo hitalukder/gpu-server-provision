@@ -1,0 +1,8 @@
+#cloud-config
+
+power_state:
+    delay: 5
+    mode: reboot
+    message: Rebooting machine
+    condition: test -f /var/run/reboot-required
+
